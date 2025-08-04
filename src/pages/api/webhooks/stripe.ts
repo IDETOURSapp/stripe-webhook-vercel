@@ -1,95 +1,116 @@
 // src/pages/api/webhooks/stripe.ts
-import { NextApiRequest, NextApiResponse } from "next";
-import Stripe from "stripe";
-import { supabase } from "../../../config/supabase";
+import { NextApiRequest, NextApiResponse } from 'next';
+import Stripe from 'stripe';
+import { supabase } from '../../../config/supabase';
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: "2023-10-16",
+  apiVersion: '2023-10-16',
 });
 
 export const config = {
   api: {
-    bodyParser: false, // Desactiva el bodyParser para manejar raw body
+    bodyParser: false,
   },
 };
 
+async function buffer(readable: any) {
+  const chunks = [];
+  for await (const chunk of readable) {
+    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  if (req.method !== "POST") {
-    res.setHeader("Allow", ["POST"]);
-    return res.status(405).end("Method Not Allowed");
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+    return res.status(405).end('Method Not Allowed');
   }
 
-  // Leer el body como texto plano (raw)
-  const rawBody = await getRawBody(req);
-  const signature = req.headers["stripe-signature"] as string;
+  const buf = await buffer(req);
+  const sig = req.headers['stripe-signature'] as string;
+
+  let event: Stripe.Event;
 
   try {
-    // Verificar la firma del webhook
-    const event = stripe.webhooks.constructEvent(
-      rawBody,
-      signature,
+    event = stripe.webhooks.constructEvent(
+      buf,
+      sig,
       process.env.STRIPE_WEBHOOK_SECRET!
     );
+  } catch (err) {
+    console.error(`Webhook Error: ${err.message}`);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
 
-    // Manejar eventos importantes
+  try {
     switch (event.type) {
-      case "checkout.session.completed":
-        await handleCheckoutSession(event.data.object);
+      case 'checkout.session.completed':
+        const session = event.data.object as Stripe.Checkout.Session;
+        await handleCheckoutSessionCompleted(session);
         break;
-      case "invoice.payment_succeeded":
-        await handleInvoicePaid(event.data.object);
+      
+      case 'invoice.payment_succeeded':
+        const invoice = event.data.object as Stripe.Invoice;
+        await handleInvoicePaymentSucceeded(invoice);
         break;
-      case "customer.subscription.deleted":
-        await handleSubscriptionCanceled(event.data.object);
+      
+      case 'customer.subscription.updated':
+        const subscription = event.data.object as Stripe.Subscription;
+        await handleSubscriptionUpdated(subscription);
         break;
+      
+      // Agrega más casos según necesites
+      
       default:
-        console.log(`Evento no manejado: ${event.type}`);
+        console.log(`Unhandled event type: ${event.type}`);
     }
 
-    res.status(200).json({ received: true });
-  } catch (err) {
-    console.error("Error en webhook:", err);
-    res.status(400).send(`Webhook Error: ${err.message}`);
+    res.json({ received: true });
+  } catch (error) {
+    console.error('Error handling webhook:', error);
+    res.status(500).json({ error: 'Error processing webhook' });
   }
 }
 
-// Función para leer el body en formato raw
-async function getRawBody(req: NextApiRequest): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
-  });
-}
+async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) {
+  if (!session.metadata?.provider_id) return;
 
-// Ejemplo: Manejar una suscripción completada
-async function handleCheckoutSession(session: Stripe.Checkout.Session) {
-  if (!session.metadata?.user_id) return;
-
-  await supabase
-    .from("memberships")
+  const { error } = await supabase
+    .from('memberships')
     .upsert({
-      user_id: session.metadata.user_id,
+      user_id: session.metadata.provider_id,
       subscription_id: session.subscription as string,
       plan: session.metadata.plan,
-      status: "active",
+      status: 'active',
+      expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(), // 30 días
     });
+
+  if (error) throw error;
 }
 
-// Ejemplo: Manejar un pago de factura exitoso
-async function handleInvoicePaid(invoice: Stripe.Invoice) {
+async function handleInvoicePaymentSucceeded(invoice: Stripe.Invoice) {
   const subscriptionId = invoice.subscription as string;
-  await supabase
-    .from("memberships")
-    .update({ expires_at: new Date(invoice.period_end * 1000).toISOString() })
-    .eq("subscription_id", subscriptionId);
+  
+  const { error } = await supabase
+    .from('memberships')
+    .update({
+      expires_at: new Date(invoice.period_end * 1000).toISOString(),
+    })
+    .eq('subscription_id', subscriptionId);
+
+  if (error) throw error;
 }
 
-// Ejemplo: Manejar una suscripción cancelada
-async function handleSubscriptionCanceled(subscription: Stripe.Subscription) {
-  await supabase
-    .from("memberships")
-    .update({ status: "canceled" })
-    .eq("subscription_id", subscription.id);
+async function handleSubscriptionUpdated(subscription: Stripe.Subscription) {
+  if (subscription.status === 'canceled') {
+    const { error } = await supabase
+      .from('memberships')
+      .update({
+        status: 'canceled',
+      })
+      .eq('subscription_id', subscription.id);
+
+    if (error) throw error;
+  }
 }

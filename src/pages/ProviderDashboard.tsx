@@ -76,58 +76,60 @@ const ProviderDashboard: React.FC = () => {
     }
   }, [location.search]);
 
-  const handlePurchaseMembership = async (plan: string) => {
-    if (!user) {
-      toast.error('Debes iniciar sesión primero');
-      return;
+// Actualiza las funciones relacionadas con Stripe en ProviderDashboard.tsx
+
+const handlePurchaseMembership = async (plan: string) => {
+  if (!user) {
+    toast.error('Debes iniciar sesión primero');
+    return;
+  }
+
+  setLoading((prev) => ({ ...prev, [plan]: true }));
+
+  try {
+    const apiUrl = `${import.meta.env.VITE_API_URL}/create-subscription`.replace(/([^:]\/)\/+/g, '$1');
+    
+    const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+    if (sessionError || !session) throw new Error('No se pudo obtener la sesión');
+
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${session.access_token}`
+      },
+      body: JSON.stringify({
+        userId: user.id,
+        plan,
+        customerEmail: user.email,
+        metadata: {
+          provider_id: user.id,
+          provider_name: profile?.full_name || 'Proveedor',
+          success_url: `${window.location.origin}/dashboard?success=true`,
+          cancel_url: `${window.location.origin}/membership-cancel`
+        }
+      })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(errorText || 'Error en la respuesta del servidor');
     }
 
-    setLoading((prev) => ({ ...prev, [plan]: true }));
+    const { sessionId } = await response.json();
+    const stripe = await stripePromise;
 
-    try {
-      const apiUrl = `${import.meta.env.VITE_API_URL}/create-subscription`;
+    if (!stripe) throw new Error('Stripe no se inicializó correctamente');
 
-      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
-      if (sessionError || !session) throw new Error('No se pudo obtener la sesión');
-
-      if (!user.email) throw new Error('No se encontró el email del usuario');
-
-      const response = await fetch(apiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${session.access_token}`
-        },
-        body: JSON.stringify({
-          userId: user.id,
-          plan,
-          customerEmail: user.email,
-          metadata: {
-            provider_id: user.id,
-            provider_name: profile?.full_name || 'Proveedor'
-          }
-        })
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error || 'Error en la respuesta del servidor');
-      }
-
-      const { sessionId } = await response.json();
-      const stripe = await stripePromise;
-
-      if (!stripe) throw new Error('Stripe no se inicializó correctamente');
-
-      const { error: stripeError } = await stripe.redirectToCheckout({ sessionId });
-      if (stripeError) throw stripeError;
-    } catch (error: any) {
-      console.error('Error en compra:', error);
-      toast.error(error.message || 'Error al procesar el pago');
-    } finally {
-      setLoading((prev) => ({ ...prev, [plan]: false }));
-    }
-  };
+    const { error: stripeError } = await stripe.redirectToCheckout({ sessionId });
+    if (stripeError) throw stripeError;
+  } catch (error: any) {
+    console.error('Error en compra:', error);
+    toast.error(error.message || 'Error al procesar el pago');
+  } finally {
+    setLoading((prev) => ({ ...prev, [plan]: false }));
+  }
+};
 
   const handleCustomerPortal = async () => {
     if (!membership?.subscription_id) {
